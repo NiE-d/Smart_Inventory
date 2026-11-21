@@ -1,0 +1,237 @@
+
+import cv2
+import numpy as np
+import urllib.request
+import time
+from pathlib import Path
+from collections import deque, Counter
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+from openpyxl import Workbook, load_workbook
+
+# ---------- SETTINGS ----------
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "component_classifier_v2.pth"
+EXCEL_PATH = BASE_DIR / "inventory.xlsx"
+IMAGE_URL = "http://127.0.0.1:5000/image"
+
+MIN_OBJECT_AREA = 500
+MIN_CONFIDENCE = 0.90
+STABLE_SECONDS = 0.8
+IMAGE_SIZE = 224
+
+# ---------- LOAD AI MODEL ----------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+class_names = checkpoint["class_names"]
+image_size = checkpoint.get("image_size", IMAGE_SIZE)
+
+model = models.mobilenet_v3_small(weights=None)
+in_features = model.classifier[3].in_features
+model.classifier[3] = nn.Linear(in_features, len(class_names))
+model.load_state_dict(checkpoint["model_state_dict"])
+model.to(device).eval()
+
+preprocess = transforms.Compose([
+    transforms.Resize((image_size, image_size)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+# ---------- CREATE / LOAD EXCEL ----------
+if EXCEL_PATH.exists():
+    wb = load_workbook(EXCEL_PATH)
+    ws = wb["Inventory"] if "Inventory" in wb.sheetnames else wb.active
+else:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Inventory"
+    ws.append(["Name", "Quantity"])
+
+if ws.max_row == 1 and ws.cell(1, 1).value is None:
+    ws.append(["Name", "Quantity"])
+elif ws.cell(1, 1).value != "Name" or ws.cell(1, 2).value != "Quantity":
+    ws.insert_rows(1)
+    ws.cell(1, 1, "Name")
+    ws.cell(1, 2, "Quantity")
+
+# Ensure every known class has a row
+def normalize_name(name):
+    return str(name).strip().lower()
+
+def find_row(name):
+    target = normalize_name(name)
+    for row in range(2, ws.max_row + 1):
+        if normalize_name(ws.cell(row, 1).value or "") == target:
+            return row
+    return None
+
+for name in class_names:
+    if find_row(name) is None:
+        ws.append([name, 0])
+
+wb.save(EXCEL_PATH)
+
+# ---------- IMAGE / CLASSIFICATION ----------
+background = cv2.createBackgroundSubtractorMOG2(
+    history=120, varThreshold=32, detectShadows=False
+)
+kernel = np.ones((5, 5), np.uint8)
+previous_x = None
+direction = None
+scan_active = False
+last_motion_time = time.time()
+predictions = deque(maxlen=5)
+frame_count = 0
+
+def get_frame():
+    url = f"{IMAGE_URL}?t={time.time_ns()}"
+    with urllib.request.urlopen(url, timeout=3) as response:
+        data = response.read()
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    return cv2.flip(frame, 1)
+
+def classify(image):
+    if image is None or image.size == 0:
+        return None, 0.0
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    from PIL import Image
+    pil_image = Image.fromarray(rgb)
+    tensor = preprocess(pil_image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        probs = torch.softmax(model(tensor), dim=1)[0]
+
+    score, index = torch.max(probs, dim=0)
+    return class_names[index.item()], score.item()
+
+def update_inventory(name, delta):
+    row = find_row(name)
+    if row is None:
+        ws.append([name, max(0, delta)])
+        row = ws.max_row
+    else:
+        old_qty = ws.cell(row, 2).value or 0
+        new_qty = max(0, int(old_qty) + delta)
+        ws.cell(row, 2, new_qty)
+
+    wb.save(EXCEL_PATH)
+    print(f"Excel updated: {name} = {ws.cell(row, 2).value}")
+
+print("SMART ELECTRONIC INVENTORY")
+print("Model:", MODEL_PATH.name)
+print("Excel:", EXCEL_PATH)
+print("Swipe LEFT TO RIGHT to add; RIGHT TO LEFT to subtract.")
+print("Press Q in the scanner window to exit.")
+
+try:
+    while True:
+        try:
+            frame = get_frame()
+            if frame is None:
+                continue
+
+            frame_count += 1
+            height, width = frame.shape[:2]
+            mask = background.apply(frame)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            objects = [
+                c for c in contours if cv2.contourArea(c) >= MIN_OBJECT_AREA
+            ]
+
+            status = "Ready - show a component"
+
+            if frame_count < 25:
+                status = "Initializing background"
+
+            elif objects:
+                contour = max(objects, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(contour)
+                cx = x + w // 2
+
+                # Direction is measured in the mirrored preview coordinates.
+                if previous_x is not None:
+                    dx = cx - previous_x
+                    if dx > 3:
+                        direction = "LEFT_TO_RIGHT"
+                    elif dx < -3:
+                        direction = "RIGHT_TO_LEFT"
+
+                previous_x = cx
+                last_motion_time = time.time()
+                scan_active = True
+
+                margin = 12
+                crop = frame[
+                    max(0, y-margin):min(height, y+h+margin),
+                    max(0, x-margin):min(width, x+w+margin)
+                ]
+
+                label, confidence = classify(crop)
+                if label and confidence >= MIN_CONFIDENCE:
+                    predictions.append((label, confidence))
+
+                current = predictions[-1][0] if predictions else "Identifying..."
+                status = f"{current} | {confidence:.0%} | {direction or 'Moving'}"
+
+            else:
+                previous_x = None
+                status = "Ready - show a component"
+
+                if scan_active and time.time() - last_motion_time > STABLE_SECONDS:
+                    scan_active = False
+
+                    if direction and predictions:
+                        counts = Counter(label for label, _ in predictions)
+                        label, votes = counts.most_common(1)[0]
+                        matching_scores = [
+                            score for name, score in predictions if name == label
+                        ]
+                        average_confidence = sum(matching_scores) / len(matching_scores)
+
+                        if average_confidence >= MIN_CONFIDENCE:
+                            if direction == "LEFT_TO_RIGHT":
+                                update_inventory(label, +1)
+                                print(f"ADDED: {label}")
+                            elif direction == "RIGHT_TO_LEFT":
+                                update_inventory(label, -1)
+                                print(f"REMOVED: {label}")
+                            else:
+                                print("Swipe direction unclear; inventory unchanged.")
+                        else:
+                            print("Confidence too low; inventory unchanged.")
+                    else:
+                        print("No clear swipe direction; inventory unchanged.")
+
+                    predictions.clear()
+                    direction = None
+
+            display = frame.copy()
+            cv2.putText(display, "SMART INVENTORY", (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(display, status, (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.imshow("Smart Inventory Scanner", display)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        except Exception as error:
+            print("Scanner error:", error)
+            time.sleep(0.2)
+
+finally:
+    cv2.destroyAllWindows()
